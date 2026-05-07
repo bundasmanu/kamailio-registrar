@@ -1,0 +1,76 @@
+name: Install Kamailio-DB Helm Chart
+description: 'Install Kamailio-DB Helm Chart'
+
+runs:
+  using: 'composite'
+  steps:
+
+    - name: Install Kamailio-DB Helm Chart (PVC disabled)
+      shell: bash
+      run: |
+        helm install kamailio-db \
+          oci://ghcr.io/bundasmanu/charts/kamailio-db \
+          --version 0.1.0 \
+          --set persistence.enabled=false
+
+    - name: Wait until StatefulSet is ready
+      shell: bash
+      run: |
+        kubectl rollout status statefulset kamailio-db \
+          -n default \
+          --timeout=120s
+
+    - name: Wait for DB service endpoints (critical DNS fix)
+      shell: bash
+      run: |
+        echo "Waiting for Kubernetes service endpoints..."
+
+        kubectl wait --for=jsonpath='{.subsets[*].addresses[*].ip}' \
+          endpoints/kamailio-db \
+          -n default \
+          --timeout=120s
+
+        echo "Endpoints ready:"
+        kubectl get endpoints kamailio-db -n default -o wide
+
+    - name: Ensure CoreDNS is ready
+      shell: bash
+      run: |
+        kubectl -n kube-system rollout status deployment/coredns \
+          --timeout=120s
+
+    - name: Check running pods and DB state
+      shell: bash
+      run: |
+        kubectl get pods -A | grep kamailio-db || true
+
+        kubectl describe pod kamailio-db-0 -n default || true
+        kubectl logs kamailio-db-0 -n default --tail=300 || true
+
+        kubectl get sts kamailio-db -n default -o jsonpath='{.spec.volumeClaimTemplates}' || true
+        kubectl get pod kamailio-db-0 -n default -o jsonpath='{.spec.volumes}' || true
+
+    - name: Validate DB connection from external pod
+      shell: bash
+      run: |
+        kubectl run psql-client \
+          --rm -i --restart=Never \
+          --image=postgres:17 \
+          -n default \
+          --env="PGPASSWORD=fake" \
+          -- sh -c '
+            echo "Waiting for PostgreSQL readiness..."
+
+            for i in $(seq 1 30); do
+              pg_isready \
+                -h kamailio-db.default.svc.cluster.local. \
+                -U fake \
+                -d kamailio && exit 0
+
+              echo "DB not ready yet..."
+              sleep 2
+            done
+
+            echo "DB FAILED TO BECOME READY"
+            exit 1
+          '

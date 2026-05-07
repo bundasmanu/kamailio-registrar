@@ -1,0 +1,67 @@
+# RollingUpdate is used for StatefulSet updates (default). OnDelete is an alternative if you need
+# manual rollout control for VoIP; not required for typical Kamailio upgrades.
+#
+# instanceName: headless Service name, StatefulSet name, ConfigMap (<instanceName>-config).
+# Pods: <instanceName>-0, <instanceName>-1, ...  FQDN:
+#   <instanceName>-<ordinal>.<instanceName>.<namespace>.svc.cluster.local
+# Only one release per namespace should share the same instanceName (fixed K8s names, not Helm release).
+#
+# __KAMAILIO_LISTEN_ADDR__ must be replaced before Kamailio starts: entrypoint.sh substitutes it with
+# ${POD_NAME}.${INSTANCE_NAME}.${POD_NAMESPACE}.svc.cluster.local using downward API env vars from the
+# StatefulSet. Kamailio binds using that DNS name (resolved at process startup). Do not commit real IPs
+# here for per-pod listen addresses.
+#
+# hostNetwork: true with replicaCount > 1 on the same node usually fails (same ports).
+# For multiple replicas: use one pod per node (pod anti-affinity / topology spread) or disable
+# hostNetwork for scale-out. Full HA SIP routing (dispatcher, stickiness) is outside this chart.
+
+instanceName: registrar-server
+
+replicaCount: 1
+
+image:
+  repository: bundasmanu/registrar-server
+  tag: latest
+  pullPolicy: Always
+
+hostNetwork: false
+
+listens:
+  - "__KAMAILIO_LISTEN_ADDR__:5060 name \"lan-internal\""
+
+aliases:
+  - "__KAMAILIO_LISTEN_ADDR__"
+
+sipsak_commands:
+  - "sipsak -s sip:__KAMAILIO_LISTEN_ADDR__:5060 -H __KAMAILIO_LISTEN_ADDR__"
+
+env:
+  CONFIGS_FOLDER: "/etc/kamailio"
+  CFGFILE: "router.cfg"
+  STARTER_KAM_USER: "kamailio"
+  STARTER_KAM_GROUP: "kamailio"
+  SHM_MEMORY: "2048"
+  PKG_MEMORY: "128"
+  RUNDIR: "/var/run/kamailio"
+
+  # Optional: Feature flags (to disable a flag comment its line. true value does not have mean, the important thing is the ENV export)
+  #WITH_DEBUG: "true"
+  #WITH_SIPTRACE: "true"
+  WITH_PROM_STATS: "true"
+
+  WITH_LOG_STDERR: "true"
+  WITH_DMQUEUE: "true"
+
+  # Prometheus stats (if WITH_PROM_STATS is enabled)
+  PROM_STATS_LISTEN: "tcp:__KAMAILIO_LISTEN_ADDR__:8123"
+
+secrets:
+  # REQUIRED: Set this to point to kube secrets name containing the DB secrets or more if needed to populate env vars
+  existingSecret: "registrar-server-secrets"
+
+# Volume configuration
+# Mount ConfigMap to /tmp/config, then copy config.cfg to /etc/kamailio in entrypoint
+# This avoids Kubernetes subPath limitation with existing directories (alternative, mount entire configs folder to /etc/kamailio, personally i prefer this approach)
+volumeMounts:
+  - name: config
+    mountPath: "/tmp/config"

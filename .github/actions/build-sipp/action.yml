@@ -1,0 +1,53 @@
+name: 'Build SIPp and run OPTIONS check'
+description: 'Pull SIPp image, run OPTIONS against Registrar-Server'
+inputs:
+  target:
+    description: 'SIP target host:port (e.g. pod IP:5060 in k3d, or node-ip:5060 with hostNetwork)'
+    required: false
+    default: '127.0.0.1:5060'
+  container_network:
+    description: >-
+      When set, SIPp runs with docker --network container:<name> so it shares the
+      k3d node netns (needed to reach Pod CIDR from the runner). Do not force SIPp
+      Via/Contact to 127.0.0.1 when targeting a pod IP—Kamailio would reply to the
+      pod loopback and SIPp would see no responses.
+    required: false
+    default: ''
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout sipp-docker (scenarios)
+      uses: actions/checkout@v6
+      with:
+        repository: bundasmanu/sipp-docker
+        ref: main
+        path: sipp-docker
+
+    - name: Pull SIPp image
+      shell: bash
+      run: docker pull ghcr.io/bundasmanu/sipp:latest
+
+    - name: SIPp OPTIONS check
+      shell: bash
+      run: |
+        set -euo pipefail
+        CONTAINER_NET="${{ inputs.container_network }}"
+        # Fallback if caller omits input or step output was empty: job env K3D_CLUSTER_NAME + docker inspect
+        if [ -z "${CONTAINER_NET}" ] && [ -n "${K3D_CLUSTER_NAME:-}" ]; then
+          CAND="k3d-${K3D_CLUSTER_NAME}-server-0"
+          if docker inspect "${CAND}" >/dev/null 2>&1; then
+            CONTAINER_NET="${CAND}"
+            echo "SIPp auto-selected container network: ${CONTAINER_NET}"
+          fi
+        fi
+        if [ -n "$CONTAINER_NET" ]; then
+          NET_FLAG=(--network "container:${CONTAINER_NET}")
+          echo "SIPp using network namespace of container: ${CONTAINER_NET}"
+        else
+          NET_FLAG=(--network host)
+          echo "SIPp using host network (runner)"
+        fi
+        docker run --rm "${NET_FLAG[@]}" \
+          -v "${{ github.workspace }}/sipp-docker/sipp-scenarios:/opt" \
+          ghcr.io/bundasmanu/sipp:latest sipp -p 50600 ${{ inputs.target }} \
+          -r 1 -rp 1000 -m 1 -sf /opt/options/options.xml

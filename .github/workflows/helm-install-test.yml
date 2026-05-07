@@ -1,0 +1,200 @@
+---
+name: Helm Chart Install Test
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - 'main'
+    tags:
+      - '*'
+
+jobs:
+  helm-test:
+    runs-on: ubuntu-latest
+    env:
+      K3D_CLUSTER_NAME: ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.16.0'
+
+      - name: Create k3d cluster
+        uses: AbsaOSS/k3d-action@v2
+        with:
+          cluster-name: ${{ env.K3D_CLUSTER_NAME }}
+          args: >-
+            --agents 1
+
+      # Hub image `latest` may lag this repo; Kamailio needs entrypoint substitution for
+      # __KAMAILIO_LISTEN_ADDR__. Build from Dockerfile and import into k3d so CI matches git HEAD.
+      - name: Load build environment (.env)
+        run: grep -v '^#' .env | grep -v '^$' >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build registrar-server image (ci tag)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: registrar-server
+          push: false
+          load: true
+          tags: bundasmanu/registrar-server:ci
+          platforms: linux/amd64
+          build-args: |
+            KAMAILIO_VERSION=${{ env.KAMAILIO_VERSION }}
+            STARTER_KAM_USER=${{ env.STARTER_KAM_USER }}
+            STARTER_KAM_GROUP=${{ env.STARTER_KAM_GROUP }}
+            CONFIGS_FOLDER=${{ env.CONFIGS_FOLDER }}
+
+      - name: Import image into k3d cluster
+        run: k3d image import bundasmanu/registrar-server:ci -c "${{ env.K3D_CLUSTER_NAME }}"
+
+      - name: Setup PostgreSQL and load SQL
+        uses: ./.github/actions/setup-postgres
+
+      - name: Create namespace and registrar-server-secrets
+        run: |
+          kubectl create namespace registrar-server --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic registrar-server-secrets \
+            --namespace registrar-server \
+            --from-literal=db-connection="fake:fake@kamailio-db.default.svc.cluster.local.:5432/kamailio"
+
+      - name: Lint chart
+        run: helm lint k8s/helm/registrar-server
+
+      - name: Template chart
+        run: |
+          set -euo pipefail
+          helm template registrar-server k8s/helm/registrar-server \
+            --namespace registrar-server \
+            --debug \
+            > /tmp/registrar-server-rendered.yaml
+          grep -q '__KAMAILIO_LISTEN_ADDR__' /tmp/registrar-server-rendered.yaml
+          ! grep -q '127\.0\.0\.2' /tmp/registrar-server-rendered.yaml
+
+      - name: Helm install
+        run: |
+          helm upgrade --install registrar-server k8s/helm/registrar-server \
+            --namespace registrar-server \
+            --set image.tag=ci \
+            --set image.pullPolicy=IfNotPresent
+
+      - name: Wait 1 min
+        run: sleep 60
+
+      - name: DNS debug pod (persistent)
+        run: |
+          kubectl run dns-debug \
+            --restart=Never \
+            --image=postgres:16-alpine \
+            --namespace registrar-server \
+            -- sleep 120
+
+          kubectl wait --for=condition=Ready pod/dns-debug -n registrar-server --timeout=60s || true
+          # Single exec — multiple rapid kubectl execs to k3d agent kubelets often cause "error dialing backend: EOF"
+          sleep 2
+          kubectl exec -n registrar-server dns-debug -- sh -ec "
+            set -e
+            echo '=== RESOLVE DB (getent) ==='
+            getent hosts kamailio-db.default.svc.cluster.local. || true
+            echo '=== TCP TEST (pg_isready) ==='
+            pg_isready -h kamailio-db.default.svc.cluster.local. -p 5432 || true
+            echo '=== RESOLV CONF ==='
+            cat /etc/resolv.conf
+            echo '=== ROUTES ==='
+            ip route 2>/dev/null || cat /proc/net/route || true
+            echo '=== SIMPLE QUERY ==='
+            env PGPASSWORD=fake psql -h kamailio-db.default.svc.cluster.local. -U fake -d kamailio -c \"SELECT 1;\"
+            echo '=== SIMPLE QUERY FOR VERSION CHECKING ==='
+            env PGPASSWORD=fake psql -h kamailio-db.default.svc.cluster.local. -U fake -d kamailio -c \"SELECT * from version;\"
+            echo '=== TABLE CHECK ==='
+            env PGPASSWORD=fake psql -h kamailio-db.default.svc.cluster.local. -U fake -d kamailio -c \"\\dt\"
+            echo '=== VIEW CHECK ==='
+            env PGPASSWORD=fake psql -h kamailio-db.default.svc.cluster.local. -U fake -d kamailio -c \"\\dv\"
+          "
+
+          kubectl logs -n registrar-server dns-debug || true
+
+          kubectl delete pod dns-debug -n registrar-server || true
+
+      - name: Debug registrar-server pods
+        if: always()
+        run: |
+          set -e
+
+          echo "=== PODS ==="
+          kubectl get pods -n registrar-server -o wide
+
+          echo "=== DEPLOYMENT STATUS ==="
+          kubectl get deployment -n registrar-server -o wide || true
+
+          echo "=== POD DETAILS ==="
+          kubectl describe pods -n registrar-server -l app.kubernetes.io/name=registrar-server || true
+
+          echo "=== RECENT EVENTS (IMPORTANT) ==="
+          kubectl get events -n registrar-server --sort-by=.lastTimestamp | tail -n 30 || true
+
+          POD=$(kubectl get pods -n registrar-server -l app.kubernetes.io/name=registrar-server \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+          if [ -z "$POD" ]; then
+            echo "No pods found"
+            exit 0
+          fi
+
+          echo "=== TARGET POD: $POD ==="
+
+          echo "=== CONTAINER STATE ==="
+          kubectl get pod -n registrar-server "$POD" -o jsonpath='{.status.containerStatuses[*].state}' || true
+          echo
+
+          echo "=== LAST LOGS ==="
+          kubectl logs -n registrar-server "$POD" --tail=300 || true
+
+          echo "=== PREVIOUS LOGS (CRASH) ==="
+          kubectl logs -n registrar-server "$POD" --previous --tail=300 || true
+
+      # hostNetwork pod shares the *scheduled node's* netns. With k3d agents, Kamailio may be on
+      # k3d-ci-agent-0, not k3d-ci-server-0 — SIPp must docker-run --network container:<that node>.
+      - name: Resolve k3d node container for registrar-server (SIPp Docker netns)
+        id: k3d_server
+        run: |
+          set -euo pipefail
+          NODE=$(kubectl get pods -n registrar-server -l app.kubernetes.io/name=registrar-server \
+            -o jsonpath='{.items[0].spec.nodeName}')
+          if [ -z "${NODE}" ]; then
+            echo "No registrar-server pod / nodeName" >&2
+            kubectl get pods -n registrar-server -o wide || true
+            exit 1
+          fi
+          if ! docker inspect "${NODE}" >/dev/null 2>&1; then
+            echo "Kubernetes node ${NODE} has no matching Docker container (expected k3d node name == container name)" >&2
+            docker ps -a
+            exit 1
+          fi
+          echo "name=${NODE}" >> "$GITHUB_OUTPUT"
+          echo "SIPp will join Docker netns of node ${NODE} (where hostNetwork Kamailio runs)"
+
+      - name: SIP target (pod IP for hostNetwork)
+        id: sipp_target
+        run: |
+          set -euo pipefail
+          POD_IP=$(kubectl get pod -n registrar-server registrar-server-0 \
+            -o jsonpath='{.status.podIP}')
+          test -n "${POD_IP}"
+          echo "SIPp target ${POD_IP}:5060 (pod IP; Kamailio listens on pod DNS after substitution)"
+          echo "address=${POD_IP}:5060" >> "$GITHUB_OUTPUT"
+
+      - name: Run SIPp OPTIONS check
+        uses: ./.github/actions/build-sipp
+        with:
+          target: ${{ steps.sipp_target.outputs.address }}
+          container_network: ${{ steps.k3d_server.outputs.name }}

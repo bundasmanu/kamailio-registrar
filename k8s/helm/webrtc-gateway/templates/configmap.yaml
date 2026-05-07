@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.instanceName }}-config
+  labels:
+    app.kubernetes.io/name: registrar-server
+    app.kubernetes.io/instance: {{ .Values.instanceName }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+  config.cfg: |
+{{ include "registrar-server.config" . | indent 4 }}
