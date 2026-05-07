@@ -43,6 +43,9 @@ substitute_kamailio_listen_addr() {
     local fqdn="${POD_NAME}.${INSTANCE_NAME}.${POD_NAMESPACE}.svc.cluster.local"
     export LISTEN_FQDN="$fqdn"
 
+    LISTEN_IP=$(getent hosts "$fqdn" | awk '{print $1}')
+    export LISTEN_IP="$LISTEN_IP"
+
     $need_cfg && { sed "s|${tok}|${fqdn}|g" "$cfg" >"${cfg}.new" && mv "${cfg}.new" "$cfg"; }
     $need_env && export PROM_STATS_LISTEN="${PROM_STATS_LISTEN//${tok}/${fqdn}}"
 
