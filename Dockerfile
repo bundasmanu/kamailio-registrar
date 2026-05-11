@@ -19,6 +19,7 @@ RUN apt update && \
     lsb-release
 
 ## install package
+## RUN curl -s https://packagecloud.io/install/repositories/gustavo/kamailio/script.deb.sh | bash
 RUN wget -qO- https://deb.kamailio.org/kamailiodebkey.gpg | gpg --dearmor 2>/dev/null | tee /usr/share/keyrings/kamailio.gpg >/dev/null && \
     echo "deb [signed-by=/usr/share/keyrings/kamailio.gpg] http://deb.kamailio.org/kamailio${KAMAILIO_VERSION} $(lsb_release -cs) main" > /etc/apt/sources.list.d/kamailio.list && \
     apt update
